@@ -1,0 +1,197 @@
+import numpy as np
+import zlib
+import gzip
+import bz2
+import brotli
+import zstandard as zstd
+import lzfse
+import pyppmd  # Requires installation via `pip install pyppmd`
+import pandas as pd
+from math import log2
+import random
+from tabulate import tabulate
+
+
+# === SIMULATE MARKOV ORDER 5 SEQUENCE ===
+def simulate_markov_order5_with_prob(n, p):
+    """Simulates a binary sequence of length n using a Markov process of order 5."""
+    sequence = np.zeros(n, dtype=int)
+    sequence[:5] = np.random.choice([0, 1], size=5)
+
+    for i in range(5, n):
+        context_sum_mod2 = np.sum(sequence[i-5:i]) % 2
+        if context_sum_mod2 == 1:
+            sequence[i] = np.random.choice([0, 1], p=[p, 1 - p])
+        else:
+            sequence[i] = np.random.choice([0, 1])
+
+    return sequence
+
+
+# === COMPRESS DATA ===
+def compress_data(data, compressor):
+    """Compresses binary data using the specified compressor."""
+    byte_data = bytes(data.tolist())
+    if compressor == "gzip":
+        return len(gzip.compress(byte_data))
+    elif compressor == "bzip2":
+        return len(bz2.compress(byte_data))
+    elif compressor == "zlib":
+        return len(zlib.compress(byte_data))
+    elif compressor == "brotli":
+        try:
+            # Try Google's Brotli library
+            return len(brotli.compress(byte_data))
+        except AttributeError:
+            # Fallback to brotlicffi implementation
+            import brotlicffi
+            compressor = brotlicffi.Compressor()
+            return len(compressor.compress(byte_data))
+    elif compressor == "zstd":
+        zstd_compressor = zstd.ZstdCompressor()
+        return len(zstd_compressor.compress(byte_data))
+    elif compressor == "lzfse":
+        return len(lzfse.compress(byte_data))
+    elif compressor == "ppmd":
+        return len(pyppmd.compress(byte_data))
+    else:
+        raise ValueError(f"Unsupported compressor: {compressor}")
+
+
+# === SERIAL INDEPENDENCE TEST ===
+def test_serial_independence_with_probs(file_sizes, compressors, order, alpha, probabilities):
+    """
+    Tests for serial independence with varying probabilities for a Markov process.
+    Outputs results in a structured dictionary.
+    """
+    results = {comp: {p: [] for p in probabilities} for comp in compressors}
+
+    for p in probabilities:
+        for size in file_sizes:
+            data = simulate_markov_order5_with_prob(size, p)
+            entropy = calculate_entropy(data, order)
+
+            for compressor in compressors:
+                compressed_size = compress_data(data, compressor)
+                test_statistic = len(data) * entropy - compressed_size
+                threshold = log2(1 / alpha)
+
+                # Null hypothesis decision
+                if test_statistic <= threshold:
+                    results[compressor][p].append("Accept")
+                else:
+                    results[compressor][p].append("Reject")
+
+    return results
+
+
+# === GOODNESS-OF-FIT TEST USING LCG ===
+def lcg_generator(M, A, C, X0, n):
+    """Linear Congruential Generator."""
+    X = X0
+    sequence = []
+    for _ in range(n):
+        X = (A * X + C) % M
+        sequence.append(X)
+    return sequence
+
+
+def extract_8bit_words(sequence, M):
+    """Extract 8-bit words from the LCG-generated sequence."""
+    mu = M // 256
+    eight_bit_words = []
+    for X in sequence:
+        if X < 256 * mu:
+            eight_bit_word = (X // 256) % 256
+            eight_bit_words.append(eight_bit_word)
+    return bytes(eight_bit_words)
+
+
+def compress_sequence(data):
+    """Compresses byte sequence using zlib."""
+    compressed_data = zlib.compress(data)
+    return len(compressed_data), len(data)
+
+
+def test_lcg_randomness(M, A, C, X0, n):
+    """Tests the randomness of LCG-generated data using compression."""
+    sequence = lcg_generator(M, A, C, X0, n)
+    extracted_data = extract_8bit_words(sequence, M)
+    compressed_length, original_length = compress_sequence(extracted_data)
+    compression_ratio = compressed_length / original_length
+
+    # Decision rule: Reject if the sequence compresses
+    result = "Reject" if compression_ratio < 1 else "Accept"
+    return original_length, compressed_length, compression_ratio, result
+
+
+# === ENTROPY CALCULATION ===
+def calculate_entropy(data, order):
+    """Estimates the entropy of a binary sequence with a given Markov order."""
+    counts = {}
+    for i in range(order, len(data)):
+        context = tuple(data[i-order:i])
+        symbol = data[i]
+        if context not in counts:
+            counts[context] = {0: 0, 1: 0}
+        counts[context][symbol] += 1
+
+    total = 0
+    for context, symbol_counts in counts.items():
+        context_total = sum(symbol_counts.values())
+        for count in symbol_counts.values():
+            if count > 0:
+                prob = count / context_total
+                total -= prob * log2(prob)
+
+    return total / len(data)
+
+
+# === MAIN FUNCTION ===
+def main():
+    # Parameters for Serial Independence Test
+    file_sizes = [2**14, 2**18, 2**20]  # 16 KB, 256 KB, 1 MB
+    compressors = ["gzip", "bzip2", "zlib", "brotli", "zstd", "lzfse", "ppmd"]
+    markov_order = 6
+    alpha = 0.01
+    probabilities = [0.8, 0.6, 0.55, 0.525, 0.5,0.4]
+
+    print("\n=== Serial Independence Test ===")
+    results = test_serial_independence_with_probs(file_sizes, compressors, markov_order, alpha, probabilities)
+
+    # Format Serial Independence Test Results into Table
+    table_data = []
+    for compressor in compressors:
+        for p in probabilities:
+            row = {
+                "Compressor": compressor,
+                "Probability": p,
+                "16 KB (2^14)": results[compressor][p][0],
+                "256 KB (2^18)": results[compressor][p][1],
+                "1 MB (2^20)": results[compressor][p][2],
+            }
+            table_data.append(row)
+    serial_independence_df = pd.DataFrame(table_data)
+    print(tabulate(serial_independence_df, headers="keys", tablefmt="grid"))
+
+    # Parameters for Goodness-of-Fit Test (LCG)
+    print("\n=== Goodness-of-Fit Test ===")
+    lcg_params = [
+        (10**8 + 1, 2**3, 0, 47594118, 400000),
+        (2**31, 2**16 + 3, 0, 1, 400000),
+        (2**32, 134775813, 1, 0, 400000),
+    ]
+    lcg_results = []
+
+    for i, (M, A, C, X0, n) in enumerate(lcg_params, 1):
+        original_length, compressed_length, compression_ratio, result = test_lcg_randomness(M, A, C, X0, n)
+        lcg_results.append((f"LCG {i}", n, original_length, compressed_length, compression_ratio, result))
+
+    # Format LCG Results into Table
+    lcg_headers = ["Test", "Data Size (bits)", "Original Length (bytes)", "Compressed Length (bytes)",
+                   "Compression Ratio", "Hypothesis"]
+    print(tabulate(lcg_results, headers=lcg_headers, tablefmt="grid"))
+
+
+if __name__ == "__main__":
+    main()
