@@ -1,0 +1,190 @@
+import numpy as np
+from scipy.stats import norm, entropy
+from collections import Counter
+import bz2, gzip, lzma, zstandard
+import py7zr
+import os
+from scipy.special import gammaincc
+
+# ================================
+# 1. Empirical Entropy Calculation
+# ================================
+def empirical_entropy(sequence):
+    counts = Counter(sequence)
+    probabilities = [v / len(sequence) for v in counts.values()]
+    return entropy(probabilities, base=2)
+
+# ==========================
+# 2. Markov Chain Generation
+# ==========================
+def generate_markov_chain(size, p, memory):
+    sequence = [0] * memory
+    for _ in range(memory, size):
+        context = sequence[-memory:]
+        prob = p if sum(context) % 2 == 0 else 1 - p
+        next_bit = 1 if np.random.rand() < prob else 0
+        sequence.append(next_bit)
+    return sequence
+
+# ====================
+# 3. Data Compressors
+# ====================
+def binary_to_bytes(data):
+    binary_string = ''.join(map(str, data))
+    padded_length = ((len(binary_string) + 7) // 8) * 8
+    binary_string = binary_string.zfill(padded_length)
+    return int(binary_string, 2).to_bytes(len(binary_string) // 8, 'big')
+
+def ppm_compress(data):
+    filename = "temp_data"
+    compressed_filename = "temp_data.7z"
+    with open(filename, "wb") as f:
+        f.write(binary_to_bytes(data))
+
+    with py7zr.SevenZipFile(compressed_filename, mode='w', filters=[{"id": py7zr.FILTER_PPMD}]) as archive:
+        archive.write(filename, "data")
+
+    with open(compressed_filename, "rb") as f:
+        compressed_data = f.read()
+
+    os.remove(filename)
+    os.remove(compressed_filename)
+    return compressed_data
+
+def bzip2_compress(data):
+    return bz2.compress(binary_to_bytes(data))
+
+def gzip_compress(data):
+    return gzip.compress(binary_to_bytes(data))
+
+def lzma_compress(data):
+    return lzma.compress(binary_to_bytes(data))
+
+def zstandard_compress(data):
+    zstd_compressor = zstandard.ZstdCompressor()
+    return zstd_compressor.compress(binary_to_bytes(data))
+
+# ===========================
+# 4. Hypothesis Testing
+# ===========================
+def hypothesis_test(data, h_empirical, alpha, compressor_fn):
+    t = len(data)
+    threshold = np.log(1 / alpha)
+
+    # Compress the data
+    compressed_data = compressor_fn(data)
+    compressed_size = len(compressed_data) * 8  # Convert bytes to bits
+
+    # Compute test value
+    test_value = t * h_empirical - compressed_size
+    return "Accept" if test_value <= threshold else "Reject"
+
+# ===========================
+# 5. NIST Randomness Tests
+# ===========================
+
+def runs_test(data):
+    n = len(data)
+    pi = sum(data) / n
+    if abs(pi - 0.5) > (2 / np.sqrt(n)):
+        return "Reject"
+    v_obs = sum(data[i] != data[i-1] for i in range(1, n)) + 1
+    p_value = norm.sf(abs(v_obs - 2 * n * pi * (1 - pi)) / (2 * np.sqrt(n) * pi * (1 - pi)))
+    return "Accept" if p_value >= 0.01 else "Reject"
+
+def serial_test(data, m=2):
+    n = len(data)
+    counts = Counter(tuple(data[i:i + m]) for i in range(n - m + 1))
+    probabilities = [v / (n - m + 1) for v in counts.values()]
+    chi_square = (n - m + 1) * sum((p - 1 / (2 ** m)) ** 2 / (1 / (2 ** m)) for p in probabilities)
+    p_value = gammaincc((2 ** m) - 1, chi_square / 2)
+    return "Accept" if p_value >= 0.01 else "Reject"
+
+def approximate_entropy_test(data, m=2):
+    n = len(data)
+    def _phi(m):
+        counts = Counter(tuple(data[i:i + m]) for i in range(n - m + 1))
+        probabilities = [v / (n - m + 1) for v in counts.values()]
+        return sum(p * np.log(p) for p in probabilities)
+    apen = _phi(m) - _phi(m + 1)
+    chi_square = 2 * n * (np.log(2) - apen)
+    p_value = gammaincc(2 ** (m - 1), chi_square / 2)
+    return "Accept" if p_value >= 0.01 else "Reject"
+
+def cumulative_sums_test(data):
+    n = len(data)
+    adjusted_data = np.array(data) * 2 - 1
+    cumulative_sums = np.cumsum(adjusted_data)
+    max_sum = max(abs(cumulative_sums))
+    p_value = 1 - gammaincc(1, max_sum / np.sqrt(n))
+    return "Accept" if p_value >= 0.01 else "Reject"
+
+def random_excursions_test(data):
+    n = len(data)
+    adjusted_data = np.array(data) * 2 - 1
+    cumulative_sums = np.cumsum(adjusted_data)
+    states = set(cumulative_sums)
+    if 0 not in states:
+        return "Reject"
+    p_values = []
+    for state in states:
+        count = np.sum(cumulative_sums == state)
+        p_values.append(norm.sf(abs(count - n / 2) / (np.sqrt(n / 4))))
+    return "Accept" if all(p >= 0.01 for p in p_values) else "Reject"
+
+# ===========================
+# 6. Main Testing Loop
+# ===========================
+def main():
+    compressors = {
+        "PPM": ppm_compress,
+        "BZIP2": bzip2_compress,
+        "GZip": gzip_compress,
+        "LZMA": lzma_compress,
+        "ZStandard": zstandard_compress,
+    }
+
+    nist_tests = {
+        "Runs Test": runs_test,
+        "Serial Test": serial_test,
+        "Approx Ent Test": approximate_entropy_test,
+        "Cumulative Sums": cumulative_sums_test,
+        "Rand Excursions": random_excursions_test,
+    }
+
+    probabilities = [0.8, 0.6, 0.55, 0.525, 0.501, 0.5001]
+    sizes = [2 ** 9 ,2 ** 14, 2 ** 18, 2 ** 20, 2 ** 23,2 ** 24]
+    memories = [5, 6]
+
+    header = f"{'Test':<20} {'Probability':<12} {'Memory':<8} "
+    for size in sizes:
+        header += f"{size:<16}"
+    print(header)
+
+    # Run Compressor Tests
+    for compressor_name, compressor_fn in compressors.items():
+        print(f"\n{compressor_name:<20}")
+        for p in probabilities:
+            for memory in memories:
+                row = f"{'':<20} {p:<12} {memory:<8}"
+                for size in sizes:
+                    data = generate_markov_chain(size, p, memory)
+                    h_empirical = empirical_entropy(data)
+                    result = hypothesis_test(data, h_empirical, 0.01, compressor_fn)
+                    row += f"{result:<16}"
+                print(row)
+
+    # Run NIST Tests
+    for test_name, test_fn in nist_tests.items():
+        print(f"\n{test_name:<20}")
+        for p in probabilities:
+            for memory in memories:
+                row = f"{'':<20} {p:<12} {memory:<8}"
+                for size in sizes:
+                    data = generate_markov_chain(size, p, memory)
+                    result = test_fn(data)
+                    row += f"{result:<16}"
+                print(row)
+
+if __name__ == "__main__":
+    main()
